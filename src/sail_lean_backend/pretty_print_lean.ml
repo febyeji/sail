@@ -19,6 +19,7 @@ let opt_extern_types : string list ref = ref []
 let opt_line_width : int ref = ref 100
 
 type global_context = {
+  type_env : Type_check.env;
   effect_info : Effects.side_effect_info;
   fun_args : string list Bindings.t;
   ctor_renames : string Bindings.t;
@@ -51,6 +52,7 @@ type context = {
   in_sail_monad : bool;  (** Indicates whether we are in an expression of `SailM _` *)
   in_except_monad : document option;
       (** Indicates whether we are in an expression of `ExceptM _ _` what the return type is. *)
+  abbrev_int : bool;  (** Abbreviation parameters and arithmetic use Sail's signed Int kind. *)
 }
 
 let context_init env global =
@@ -62,6 +64,7 @@ let context_init env global =
     loop_level = 0;
     in_sail_monad = false;
     in_except_monad = None;
+    abbrev_int = false;
   }
 let context_with_env ctx env = { ctx with env }
 
@@ -234,14 +237,19 @@ let rec doc_nexp ctx (Nexp_aux (n, l) as nexp) =
   and uneg (Nexp_aux (n, l) as nexp) =
     match n with Nexp_neg n -> parens (separate space [minus; uneg n]) | _ -> exp nexp
   and exp (Nexp_aux (n, l) as nexp) =
-    match n with Nexp_exp n -> separate space [string "2"; caret; exp n] | _ -> app nexp
+    match n with
+    | Nexp_exp n when ctx.abbrev_int -> separate space [string "2"; caret; doc_nat_nexp ctx n]
+    | Nexp_exp n -> separate space [string "2"; caret; exp n]
+    | _ -> app nexp
   and app (Nexp_aux (n, l) as nexp) =
     match n with
     | Nexp_if (i, t, e) ->
         separate space [string "if ("; doc_nconstraint ctx i; string " : Bool) then"; atomic t; string "else"; atomic e]
     | Nexp_app (Id_aux (Id "div", _), [n1; n2]) -> separate space [atomic n1; string "/"; atomic n2]
     | Nexp_app (Id_aux (Id "mod", _), [n1; n2]) -> separate space [atomic n1; string "%"; atomic n2]
-    | Nexp_app (Id_aux (Id "abs", _), [n1]) -> separate dot [atomic n1; string "natAbs"]
+    | Nexp_app (Id_aux (Id "abs", _), [n1]) ->
+        if ctx.abbrev_int then parens (separate dot [doc_int_nexp ctx n1; string "natAbs"] ^^ string " : Int")
+        else separate dot [atomic n1; string "natAbs"]
     | _ -> atomic nexp
   and atomic (Nexp_aux (n, l) as nexp) =
     match n with
@@ -252,9 +260,27 @@ let rec doc_nexp ctx (Nexp_aux (n, l) as nexp) =
     | Nexp_app (Id_aux (Id ("div" | "mod"), _), [_; _])
     | Nexp_app (Id_aux (Id "abs", _), [_]) ->
         parens (plussub nexp)
+    | Nexp_app (id, args) when Bindings.mem id (Env.get_typ_synonyms ctx.env) ->
+        parens (separate space (doc_id_ctor ctx id :: List.map (doc_int_nexp ctx) args))
     | _ -> failwith ("NExp " ^ string_of_nexp_con nexp ^ " " ^ string_of_nexp nexp ^ " not translatable yet.")
   in
-  atomic nexp
+  match n with
+  | Nexp_constant _ -> atomic nexp
+  | _ -> if ctx.abbrev_int then parens (atomic nexp ^^ string " : Int") else atomic nexp
+
+and doc_int_nexp ctx nexp =
+  let doc = doc_nexp { ctx with abbrev_int = true } nexp in
+  match nexp with Nexp_aux (Nexp_constant _, _) -> parens (doc ^^ string " : Int") | _ -> doc
+
+and doc_nat_nexp ctx nexp =
+  (* Keep signed arithmetic until the boundary with Lean's Nat indices. On Sail's
+     nonnegative length/exponent domain, toNat preserves the value. *)
+  match nexp with
+  | Nexp_aux (Nexp_constant n, _) when Z.sign n >= 0 -> doc_big_int n
+  | _ -> if ctx.abbrev_int then parens (doc_nexp ctx nexp ^^ string ".toNat") else doc_nexp ctx nexp
+
+and doc_abbrev_arg ctx (A_aux (arg, _) as typ_arg) =
+  match arg with A_nexp nexp -> doc_int_nexp ctx nexp | _ -> doc_typ_arg ctx `All typ_arg
 
 and doc_nconstraint ctx (NC_aux (nc, _)) =
   match nc with
@@ -262,7 +288,11 @@ and doc_nconstraint ctx (NC_aux (nc, _)) =
   | NC_or (n1, n2) -> flow (break 1) [doc_nconstraint ctx n1; string "∨"; doc_nconstraint ctx n2]
   | NC_equal (a1, a2) -> flow (break 1) [doc_typ_arg ctx `All a1; string "="; doc_typ_arg ctx `All a2]
   | NC_not_equal (a1, a2) -> flow (break 1) [doc_typ_arg ctx `All a1; string "≠"; doc_typ_arg ctx `All a2]
-  | NC_app (f, args) -> doc_id_ctor ctx f ^^ parens (separate_map comma_sp (doc_typ_arg ctx `All) args)
+  | NC_app (f, args) ->
+      let doc_arg =
+        if Bindings.mem f (Env.get_typ_synonyms ctx.env) then doc_abbrev_arg ctx else doc_typ_arg ctx `All
+      in
+      parens (separate space (doc_id_ctor ctx f :: List.map doc_arg args))
   | NC_false -> string "false"
   | NC_true -> string "true"
   | NC_ge (n1, n2) -> flow (break 1) [doc_nexp ctx n1; string "≥"; doc_nexp ctx n2]
@@ -271,12 +301,8 @@ and doc_nconstraint ctx (NC_aux (nc, _)) =
   | NC_lt (n1, n2) -> flow (break 1) [doc_nexp ctx n1; string "<"; doc_nexp ctx n2]
   | NC_id i -> doc_id_ctor ctx i
   | NC_set (n, vs) ->
-      flow (break 1)
-        [
-          doc_nexp ctx n;
-          string "∈";
-          implicit_parens (separate_map comma_sp (fun x -> string (Nat_big_num.to_string x)) vs);
-        ]
+      string "decide "
+      ^^ parens (flow (break 1) [doc_nexp ctx n; string "∈"; brackets (separate_map comma_sp doc_big_int vs)])
   | NC_var ki -> doc_kid ctx ki
 
 and doc_typ_arg ctx rel (A_aux (t, _)) =
@@ -289,11 +315,36 @@ and doc_typ_arg ctx rel (A_aux (t, _)) =
 
 and provably_nneg ctx x = Type_check.prove __POS__ ctx.env (nc_gteq x (nint 0))
 
+and doc_type_application_args ctx id args =
+  if Bindings.mem id (Env.get_typ_synonyms ctx.env) then List.map (doc_abbrev_arg ctx) args
+  else (
+    let quantifiers =
+      if Env.is_record id ctx.env then Some (fst (Env.get_record id ctx.env))
+      else Option.map fst (Bindings.find_opt id (Env.get_variants ctx.env))
+    in
+    match quantifiers with
+    | Some tq when ctx.abbrev_int ->
+        (* Records and variants retain their existing Nat/Int parameter convention.
+           Use their declaration environment, not the caller's constraints. *)
+        let decl_ctx = { ctx with env = Env.add_typquant Unknown tq ctx.global.type_env } in
+        let params = quant_kopts tq in
+        List.map2
+          (fun param arg ->
+            match (param, arg) with
+            | KOpt_aux (KOpt_kind (K_aux (K_int, _), kid), _), A_aux (A_nexp n, _) when provably_nneg decl_ctx (nvar kid)
+              ->
+                doc_nat_nexp ctx n
+            | _ -> doc_typ_arg ctx `All arg
+          )
+          params args
+    | _ -> List.map (doc_typ_arg ctx `Only_relevant) args
+  )
+
 and doc_typ ctx (Typ_aux (t, _) as typ) =
   match t with
   | Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp m, _); A_aux (A_typ elem_typ, _)]) ->
       (* TODO: remove duplication with exists, below *)
-      nest 2 (parens (flow space [string "Vector"; doc_typ ctx elem_typ; doc_nexp ctx m]))
+      nest 2 (parens (flow space [string "Vector"; doc_typ ctx elem_typ; doc_nat_nexp ctx m]))
   | Typ_id (Id_aux (Id "unit", _)) -> string "Unit"
   | Typ_id (Id_aux (Id "int", _)) -> string "Int"
   | Typ_id (Id_aux (Id "string", _)) -> string "String"
@@ -302,7 +353,7 @@ and doc_typ ctx (Typ_aux (t, _) as typ) =
   | Typ_id (Id_aux (Id "nat", _)) -> string "Nat"
   | Typ_app (Id_aux (Id "bitvector", _), [A_aux (A_nexp m, _)]) | Typ_app (Id_aux (Id "bits", _), [A_aux (A_nexp m, _)])
     ->
-      parens (string "BitVec " ^^ doc_nexp ctx m)
+      parens (string "BitVec " ^^ doc_nat_nexp ctx m)
   | Typ_app (Id_aux (Id "atom", _), [A_aux (A_nexp x, _)]) -> if provably_nneg ctx x then string "Nat" else string "Int"
   | Typ_app (Id_aux (Id "register", _), t_app) ->
       parens (string "RegisterRef " ^^ separate_map comma (doc_typ_app ctx) t_app)
@@ -318,8 +369,7 @@ and doc_typ ctx (Typ_aux (t, _) as typ) =
   | Typ_app (Id_aux (Id "result", _), [A_aux (A_typ typ1, _); A_aux (A_typ typ2, _)]) ->
       parens (separate space [string "Result"; doc_typ ctx typ1; doc_typ ctx typ2])
   | Typ_var kid -> doc_kid ctx kid
-  | Typ_app (id, args) ->
-      parens (doc_id_ctor ctx id ^^ space ^^ separate_map space (doc_typ_arg ctx `Only_relevant) args)
+  | Typ_app (id, args) -> parens (doc_id_ctor ctx id ^^ space ^^ separate space (doc_type_application_args ctx id args))
   | Typ_exist (kids, _, typ) ->
       let ctx =
         List.fold_left
@@ -374,12 +424,6 @@ let doc_typ_quant_relevant ctx tq =
      in order to detect when we can translate the Kind as Nat *)
   let ctx = context_init (Type_check.Env.add_typquant Unknown tq ctx.env) ctx.global in
   List.filter_map (doc_quant_item_relevant ctx) tq
-
-let doc_quant_item_only_vars ctx (QI_aux (qi, annot)) =
-  match qi with QI_id (KOpt_aux (KOpt_kind (k, ki), _)) -> Some (doc_kid ctx ki) | QI_constraint c -> None
-
-(* Used to translate type parameters of type abbreviations *)
-let doc_typ_quant_only_vars ctx tq = List.filter_map (doc_quant_item_only_vars ctx) tq
 
 let lean_escape_string s = Str.global_replace (Str.regexp "\"") "\\\"" s
 
@@ -1258,6 +1302,21 @@ let string_of_type_def_con (TD_aux (td, _)) =
   | TD_enum _ -> "TD_enum"
 
 let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
+  let doc_abbrev id tq result body =
+    (* Unlike term parameters, abbreviation Int parameters must have a stable
+       representation independent of the constraints at each application site.
+       doc_abbrev_arg uses the same convention; conversions occur at Nat boundaries. *)
+    let ctx = { ctx with env = Env.add_typquant Unknown tq ctx.env; abbrev_int = true } in
+    let binder (QI_aux (qi, _)) =
+      match qi with
+      | QI_id (KOpt_aux (KOpt_kind (K_aux (kind, _), kid), _)) ->
+          let kind = match kind with K_int -> "Int" | K_bool -> "Bool" | K_type -> "Type" in
+          Some (parens (flow space [doc_kid ctx kid; colon; string kind]))
+      | QI_constraint _ -> None
+    in
+    let vars = separate space (List.filter_map binder tq) in
+    nest 2 (flow (break 1) (remove_empties [string "abbrev"; doc_id_ctor ctx id; vars; result; coloneq; body ctx]))
+  in
   match td with
   | TD_enum (id, members, _) ->
       let ids = List.map fst members in
@@ -1285,26 +1344,11 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
            (flow (break 1) (remove_empties [string "structure"; doc_id_ctor ctx id; rectyp; string "where"])
            ^^ hardline ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
            )
-  | TD_abbrev (id, tq, A_aux (A_typ (Typ_aux (Typ_app (Id_aux (Id "range", _), _), _) as t), _)) ->
-      let vars = doc_typ_quant_relevant ctx tq in
-      let vars = List.map parens vars in
-      let vars = separate space vars in
-      nest 2 (flow (break 1) (remove_empties [string "abbrev"; doc_id_ctor ctx id; vars; coloneq; doc_typ ctx t]))
   | TD_abbrev (id, tq, A_aux (A_typ t, _)) when string_of_id id = "fp_bits" ->
       string (Printf.sprintf "-- Abbreviation %s skipped" (string_of_id id)) (* FIXME *)
-  | TD_abbrev (id, tq, A_aux (A_typ t, _)) ->
-      let vars = doc_typ_quant_only_vars ctx tq in
-      let vars = separate space vars in
-      nest 2 (flow (break 1) (remove_empties [string "abbrev"; doc_id_ctor ctx id; vars; coloneq; doc_typ ctx t]))
-  | TD_abbrev (id, tq, A_aux (A_nexp ne, _)) ->
-      let vars = doc_typ_quant_only_vars ctx tq in
-      let vars = separate space vars in
-      nest 2 (flow (break 1) [string "abbrev"; doc_id_ctor ctx id; colon; string "Int"; coloneq; doc_nexp ctx ne])
-  | TD_abbrev (id, [], A_aux (A_bool nc, _)) ->
-      (* We currently cannot handle explicit parameters because of the Int/Nat mismatch. *)
-      nest 2
-        (flow (break 1) [string "abbrev"; doc_id_ctor ctx id; colon; string "Bool"; coloneq; doc_nconstraint ctx nc])
-  | TD_abbrev _ -> empty
+  | TD_abbrev (id, tq, A_aux (A_typ t, _)) -> doc_abbrev id tq empty (fun ctx -> doc_typ ctx t)
+  | TD_abbrev (id, tq, A_aux (A_nexp ne, _)) -> doc_abbrev id tq (string ": Int") (fun ctx -> doc_nexp ctx ne)
+  | TD_abbrev (id, tq, A_aux (A_bool nc, _)) -> doc_abbrev id tq (string ": Bool") (fun ctx -> doc_nconstraint ctx nc)
   | TD_variant (id, tq, ar, _) ->
       let pp_tus = concat (List.map (fun tu -> hardline ^^ doc_type_union ctx tu) ar) in
       let rectyp = doc_typ_quant_relevant ctx tq in
@@ -1669,7 +1713,14 @@ let pp_ast_lean symbols (env : Type_check.env) effect_info ({ defs; _ } as ast :
   let fun_args = populate_fun_args defs in
   let ctor_renames = compute_ctor_renames env in
   let global =
-    { effect_info; fun_args; ctor_renames; kid_id_renames = KBindings.empty; kid_id_renames_rev = Bindings.empty }
+    {
+      type_env = env;
+      effect_info;
+      fun_args;
+      ctor_renames;
+      kid_id_renames = KBindings.empty;
+      kid_id_renames_rev = Bindings.empty;
+    }
   in
   let ctx = context_init env global in
   let inst_defs, defs = Callgraph.partition_instantiation_definitions false defs in
