@@ -13,7 +13,7 @@ namespace Out
 
 abbrev bit := (BitVec 1)
 
-abbrev bits k_n := (BitVec k_n)
+abbrev bits (k_n : Int) := (BitVec ((k_n : Int).toNat))
 
 /-- Type quantifiers: k_a : Type -/
 inductive option (k_a : Type) where
@@ -22,7 +22,7 @@ inductive option (k_a : Type) where
   deriving Inhabited, BEq, Repr
   open option
 
-abbrev xlen  : Int := 32
+abbrev xlen : Int := 32
 
 abbrev Register := PEmpty
 abbrev RegisterType : Register -> Type := PEmpty.elim
